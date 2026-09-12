@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "framework": "nextjs",
+  "crons": [
+    {
+      "path": "/api/telegram/check-reminders",
+      "schedule": "* * * * *"
+    }
+  ]
+}
