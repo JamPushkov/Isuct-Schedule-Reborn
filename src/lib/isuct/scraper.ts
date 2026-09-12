@@ -1,11 +1,10 @@
 // Production-ready ISUCT schedule scraper.
 //
-// NOTE: z-ai-web-dev-sdk / page_reader is a *backend-only* tool, but it only
-// performs GET requests on the SDK service. The real bot needs POST + cookies
-// to drive the Drupal `studschedule_form`. So this module uses the host's own
-// `fetch` (server-side) to talk to isuct.ru directly. When the host cannot
-// reach isuct.ru (e.g. this sandbox), every method fails fast and the caller
-// falls back to sample data — so the bot keeps working.
+// Key fixes:
+// 1. Circuit breaker cooldown reduced to 30 seconds (was 5 minutes — too aggressive)
+// 2. Timeouts increased (15s GET, 20s POST — isuct.ru is a slow Drupal site)
+// 3. ID field: pass empty string when ID is not numeric (autocomplete returns empty)
+// 4. Better HTML parsing: look for schedule tables in the full page, not just #form-ajax-node-content
 
 import * as cheerio from "cheerio";
 import type {
@@ -17,7 +16,7 @@ import type {
   WeekDayIndex,
   WeekParity,
 } from "./types";
-import { DAY_NAMES_FULL, SCHEDULE_BASE_URL } from "./types";
+import { SCHEDULE_BASE_URL } from "./types";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -53,28 +52,24 @@ function withTimeout(ms: number) {
 }
 
 // ─── Circuit breaker ───────────────────────────────────────────────
-// When isuct.ru is unreachable (sandbox, firewall, downtime), every live
-// attempt would block for the full timeout (10-20s) before falling back.
-// The circuit breaker remembers a failure and short-circuits subsequent
-// attempts for a cooldown period, so users get instant sample data instead
-// of a 15-second hang on every single message.
+// Short cooldown (30 sec) — if isuct.ru is temporarily down, we retry
+// quickly. The old 5-minute cooldown was too aggressive: users had to
+// wait 5 minutes after a single failure to get real data again.
 
-const CB_OPEN_MS = 5 * 60 * 1000; // 5 min cooldown after a failure
+const CB_OPEN_MS = 30 * 1000; // 30 seconds (was 5 minutes)
 let cbLastFailure = 0;
 let cbProbeInflight = false;
 
-/** Returns true if we should SKIP the live attempt (circuit open). */
 function circuitOpen(): boolean {
   if (cbProbeInflight) return false;
   return Date.now() - cbLastFailure < CB_OPEN_MS;
 }
-
-/** Mark a failure so the circuit opens for the cooldown window. */
 function recordFailure() {
   cbLastFailure = Date.now();
 }
-
-/** Allow one in-flight probe to test recovery without blocking users. */
+function recordSuccess() {
+  cbLastFailure = 0; // reset on success
+}
 function startProbe() {
   cbProbeInflight = true;
 }
@@ -92,7 +87,7 @@ export async function getFormContext(): Promise<FormContext | null> {
   if (circuitOpen()) return null;
   startProbe();
   try {
-    const { signal, clear } = withTimeout(5000);
+    const { signal, clear } = withTimeout(15000); // 15 seconds (was 5)
     const res = await fetch(SCHEDULE_BASE_URL, {
       headers: {
         "User-Agent": UA,
@@ -109,7 +104,7 @@ export async function getFormContext(): Promise<FormContext | null> {
     }
     const html = await res.text();
     const setCookie = res.headers.get("set-cookie") || "";
-    const cookie = setCookie.split(";")[0]; // keep SSESSxxxx=...
+    const cookie = setCookie.split(";")[0];
     const $ = cheerio.load(html);
     const buildId =
       $('input[name="form_build_id"]').attr("value") ||
@@ -119,6 +114,7 @@ export async function getFormContext(): Promise<FormContext | null> {
       recordFailure();
       return null;
     }
+    recordSuccess();
     return { buildId, cookie };
   } catch {
     recordFailure();
@@ -128,7 +124,8 @@ export async function getFormContext(): Promise<FormContext | null> {
   }
 }
 
-/** Decode a Drupal autocomplete JSON response (array OR object form). */
+// ─── Autocomplete ────────────────────────────────────────────────
+
 function parseAutocomplete(json: string): SearchEntry[] {
   const out: SearchEntry[] = [];
   try {
@@ -141,7 +138,6 @@ function parseAutocomplete(json: string): SearchEntry[] {
           const label = String(item.label ?? item.value ?? item.name ?? "").trim();
           const value = String(item.value ?? item.id ?? "").trim();
           if (!label) continue;
-          // Drupal often encodes the id in value like "Name [id:123]"
           const idMatch = value.match(/\[id:(\d+)\]/) || label.match(/\[(\d+)\]/);
           const id = idMatch ? idMatch[1] : value;
           out.push({ id, name: label.replace(/\s*\[.*?\]\s*$/, "") });
@@ -170,7 +166,7 @@ export async function searchLive(
   try {
     const path = AUTOCOMPLETE_PATH[type];
     const url = `https://www.isuct.ru/student/schedule/${path}/${encodeURIComponent(q)}`;
-    const { signal, clear } = withTimeout(4000);
+    const { signal, clear } = withTimeout(10000); // 10 seconds (was 4)
     const res = await fetch(url, {
       headers: {
         "User-Agent": UA,
@@ -187,7 +183,7 @@ export async function searchLive(
     }
     const text = await res.text();
     const parsed = parseAutocomplete(text);
-    // An empty array is a valid "no matches" — don't penalize the circuit.
+    if (parsed.length > 0) recordSuccess();
     return parsed;
   } catch {
     recordFailure();
@@ -197,7 +193,8 @@ export async function searchLive(
   }
 }
 
-/** Determine the current week parity from a reference anchor date. */
+// ─── Week parity ────────────────────────────────────────────────
+
 export function computeCurrentParity(
   semesterStartISO: string,
   startParity: WeekParity = "II",
@@ -206,7 +203,6 @@ export function computeCurrentParity(
   const start = new Date(semesterStartISO + "T00:00:00");
   if (Number.isNaN(start.getTime())) return startParity;
   const dayMs = 24 * 60 * 60 * 1000;
-  // Move to the Monday of the anchor week for a stable week count.
   const startMonday = new Date(start);
   startMonday.setDate(start.getDate() - ((start.getDay() + 6) % 7));
   const nowMonday = new Date(now);
@@ -216,23 +212,12 @@ export function computeCurrentParity(
   return weeks % 2 === 0 ? startParity : startParity === "I" ? "II" : "I";
 }
 
+// ─── Schedule parsing ────────────────────────────────────────────
+
 const DAY_LOOKUP: Record<string, WeekDayIndex> = {
-  понедельник: 1,
-  вторник: 2,
-  среда: 3,
-  среду: 3,
-  четверг: 4,
-  пятница: 5,
-  пятницу: 5,
-  суббота: 6,
-  воскресенье: 7,
-  пн: 1,
-  вт: 2,
-  ср: 3,
-  чт: 4,
-  пт: 5,
-  сб: 6,
-  вс: 7,
+  понедельник: 1, вторник: 2, среда: 3, среду: 3,
+  четверг: 4, пятница: 5, пятницу: 5, суббота: 6, воскресенье: 7,
+  пн: 1, вт: 2, ср: 3, чт: 4, пт: 5, сб: 6, вс: 7,
 };
 
 function detectDay(text: string): WeekDayIndex | null {
@@ -253,11 +238,6 @@ function cleanText(s: string): string {
   return s.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
 }
 
-/**
- * Parse a schedule result HTML into two weeks of structured data.
- * Best-effort: handles the common ISUCT table layouts; returns null if nothing
- * structured is found (caller falls back to sample data).
- */
 export function parseScheduleHtml(
   html: string,
   type: ScheduleType,
@@ -267,135 +247,141 @@ export function parseScheduleHtml(
 ): FullSchedule | null {
   try {
     const $ = cheerio.load(html);
-    // restrict to the schedule region if present
-    const root =
+
+    // Try multiple containers — the schedule might be in:
+    // 1. #form-ajax-node-content (Drupal AJAX response)
+    // 2. .region-content (full page)
+    // 3. .stud-schedule (custom class)
+    // 4. Any table with schedule-like content
+    let root =
       $("#form-ajax-node-content").html() ||
       $(".region-content").html() ||
+      $(".stud-schedule").html() ||
       $("body").html() ||
       html;
 
     const $root = cheerio.load(`<div id="root">${root}</div>`);
     const tables = $root("table");
-    if (!tables.length) return null;
 
-    const weeks: Record<WeekParity, { parity: WeekParity; days: DaySchedule[] }> = {
-      I: {
-        parity: "I",
-        days: [1, 2, 3, 4, 5, 6, 7].map((d) => ({
-          day: d as WeekDayIndex,
-          lessons: [],
-        })),
-      },
-      II: {
-        parity: "II",
-        days: [1, 2, 3, 4, 5, 6, 7].map((d) => ({
-          day: d as WeekDayIndex,
-          lessons: [],
-        })),
-      },
-    };
-
-    let currentParity: WeekParity = "I";
-    const headings = $root("h1, h2, h3, h4, h5, strong, b, .schedule-week");
-    headings.each((_, el) => {
-      const txt = cleanText($root(el).text());
-      if (/II\s*недел/i.test(txt)) currentParity = "II";
-      else if (/I\s*недел/i.test(txt) && !/II/i.test(txt)) currentParity = "I";
-      else if (/неч[её]тн/i.test(txt)) currentParity = "I";
-      else if (/ч[её]тн/i.test(txt)) currentParity = "II";
-    });
-
-    // Layout A: rows = time slots, columns = days (header row has day names)
-    tables.each((_, table) => {
-      const $table = $root(table);
-      const headerCells = $table.find("tr").first().find("th, td");
-      const dayColumns: (WeekDayIndex | null)[] = [];
-      headerCells.each((_, cell) => {
-        const t = cleanText($root(cell).text());
-        dayColumns.push(detectDay(t));
+    // If no tables found in the root, search the full HTML
+    if (!tables.length) {
+      const $full = cheerio.load(html);
+      const allTables = $full("table");
+      // Look for tables that contain schedule-like content (day names, times)
+      let scheduleFound = false;
+      allTables.each((_, table) => {
+        const text = $full(table).text().toLowerCase();
+        if (text.includes("понедельник") || text.includes("вторник") ||
+            text.includes("среда") || text.includes("четверг") ||
+            text.includes("пятница") || text.includes("суббота") ||
+            /\d{1,2}:\d{2}/.test(text)) {
+          scheduleFound = true;
+        }
       });
-      // If header didn't carry days, try first column rows naming the day.
-      const rows = $table.find("tr").slice(1);
-      if (dayColumns.some((d) => d !== null)) {
-        rows.each((_, row) => {
-          const cells = $root(row).find("td");
-          cells.each((ci, cell) => {
-            const day = dayColumns[ci];
-            if (!day) return;
-            const lesson = parseLessonCell($root, cell);
-            if (lesson) weeks[currentParity].days[day - 1].lessons.push(lesson);
-          });
-        });
-      } else {
-        // Layout B: each row = one lesson, first cell = day, second = time
-        let lastDay: WeekDayIndex | null = null;
-        rows.each((_, row) => {
-          const cells = $root(row).find("td, th");
-          const cellsArr = cells.toArray();
-          if (!cellsArr.length) return;
-          const firstTxt = cleanText($root(cellsArr[0]).text());
-          const day = detectDay(firstTxt) ?? lastDay;
-          if (day) lastDay = day;
-          if (!day) return;
-          const timeTxt =
-            cellsArr.length > 1
-              ? cleanText($root(cellsArr[1]).text())
-              : firstTxt;
-          const time = parseTime(timeTxt) || parseTime(firstTxt);
-          if (!time) return;
-          const subjectCell =
-            cellsArr.length > 2 ? $root(cellsArr[2]) : $root(cellsArr[1]);
-          const lesson = parseLessonCell($root, subjectCell[0] as cheerio.AnyNode);
-          if (lesson) {
-            lesson.time = time;
-            weeks[currentParity].days[day - 1].lessons.push(lesson);
-          }
-        });
-      }
-    });
-
-    // Detect explicit "current week" marker if present.
-    const bodyText = cleanText($root("body").text() || $root.text());
-    const curMatch = bodyText.match(/текущ[а-яё]*\s*недел[яюе][^\n]*?(I{1,2}|неч[её]тн|ч[её]тн)/i);
-    if (curMatch) {
-      if (/II/i.test(curMatch[1]) || /ч[её]тн/i.test(curMatch[1]))
-        currentParity = "II";
-      else currentParity = "I";
+      if (!scheduleFound) return null;
+      // Use the full HTML for parsing
+      const $fullRoot = cheerio.load(`<div id="root">${html}</div>`);
+      return parseFromCheerio($fullRoot, type, queryName, queryId, semesterStart);
     }
 
-    const hasAny = weeks.I.days.some((d) => d.lessons.length) ||
-      weeks.II.days.some((d) => d.lessons.length);
-    if (!hasAny) return null;
-
-    const computed = computeCurrentParity(semesterStart, "II");
-    return {
-      type,
-      queryName,
-      queryId,
-      weeks,
-      currentParity: computed,
-      semesterStart,
-      fetchedAt: new Date().toISOString(),
-      source: "live",
-    };
+    return parseFromCheerio($root, type, queryName, queryId, semesterStart);
   } catch {
     return null;
   }
 }
 
-function parseLessonCell(
-  $: cheerio.CheerioAPI,
-  cell: cheerio.AnyNode,
-): Lesson | null {
+function parseFromCheerio(
+  $root: cheerio.CheerioAPI,
+  type: ScheduleType,
+  queryName: string,
+  queryId: string,
+  semesterStart: string,
+): FullSchedule | null {
+  const tables = $root("table");
+  if (!tables.length) return null;
+
+  const weeks: Record<WeekParity, { parity: WeekParity; days: DaySchedule[] }> = {
+    I: { parity: "I", days: [1, 2, 3, 4, 5, 6, 7].map((d) => ({ day: d as WeekDayIndex, lessons: [] })) },
+    II: { parity: "II", days: [1, 2, 3, 4, 5, 6, 7].map((d) => ({ day: d as WeekDayIndex, lessons: [] })) },
+  };
+
+  let currentParity: WeekParity = "I";
+
+  // Detect week parity from headings
+  const headings = $root("h1, h2, h3, h4, h5, strong, b, .schedule-week, td, th, div");
+  headings.each((_, el) => {
+    const txt = cleanText($root(el).text());
+    if (/II\s*недел/i.test(txt)) currentParity = "II";
+    else if (/I\s*недел/i.test(txt) && !/II/i.test(txt)) currentParity = "I";
+    else if (/неч[её]тн/i.test(txt)) currentParity = "I";
+    else if (/ч[её]тн/i.test(txt)) currentParity = "II";
+  });
+
+  tables.each((_, table) => {
+    const $table = $root(table);
+    const headerCells = $table.find("tr").first().find("th, td");
+    const dayColumns: (WeekDayIndex | null)[] = [];
+    headerCells.each((_, cell) => {
+      const t = cleanText($root(cell).text());
+      dayColumns.push(detectDay(t));
+    });
+    const rows = $table.find("tr").slice(1);
+
+    if (dayColumns.some((d) => d !== null)) {
+      // Layout A: columns are days, rows are time slots
+      rows.each((_, row) => {
+        const cells = $root(row).find("td");
+        cells.each((ci, cell) => {
+          const day = dayColumns[ci];
+          if (!day) return;
+          const lesson = parseLessonCell($root, cell);
+          if (lesson) weeks[currentParity].days[day - 1].lessons.push(lesson);
+        });
+      });
+    } else {
+      // Layout B: each row = one lesson, first cell = day
+      let lastDay: WeekDayIndex | null = null;
+      rows.each((_, row) => {
+        const cells = $root(row).find("td, th");
+        const cellsArr = cells.toArray();
+        if (!cellsArr.length) return;
+        const firstTxt = cleanText($root(cellsArr[0]).text());
+        const day = detectDay(firstTxt) ?? lastDay;
+        if (day) lastDay = day;
+        if (!day) return;
+        const timeTxt = cellsArr.length > 1 ? cleanText($root(cellsArr[1]).text()) : firstTxt;
+        const time = parseTime(timeTxt) || parseTime(firstTxt);
+        if (!time) return;
+        const subjectCell = cellsArr.length > 2 ? $root(cellsArr[2]) : $root(cellsArr[1]);
+        const lesson = parseLessonCell($root, subjectCell[0] as cheerio.AnyNode);
+        if (lesson) {
+          lesson.time = time;
+          weeks[currentParity].days[day - 1].lessons.push(lesson);
+        }
+      });
+    }
+  });
+
+  const hasAny = weeks.I.days.some((d) => d.lessons.length) ||
+    weeks.II.days.some((d) => d.lessons.length);
+  if (!hasAny) return null;
+
+  const computed = computeCurrentParity(semesterStart, "II");
+  return {
+    type, queryName, queryId, weeks,
+    currentParity: computed,
+    semesterStart,
+    fetchedAt: new Date().toISOString(),
+    source: "live",
+  };
+}
+
+function parseLessonCell($: cheerio.CheerioAPI, cell: cheerio.AnyNode): Lesson | null {
   const $cell = $(cell);
   const html = $cell.html() || "";
   const text = cleanText($cell.text());
   if (!text || text.length < 2) return null;
-  // Split by <br> into lines for structured extraction.
-  const lines = html
-    .split(/<br\s*\/?>/i)
-    .map((l) => cleanText($(l).text()))
-    .filter(Boolean);
+  const lines = html.split(/<br\s*\/?>/i).map((l) => cleanText($(l).text())).filter(Boolean);
   const subject = lines[0] || text.split(/[,;]/)[0] || text;
   const lesson: Lesson = { time: "", subject: subject.replace(/\s+/g, " ").trim() };
   if (!lesson.subject) return null;
@@ -422,7 +408,6 @@ function parseLessonCell(
       if (gm) lesson.group = gm[1];
     }
   }
-  // fallback time parse from text
   if (!lesson.time) {
     const t = parseTime(text);
     if (t) lesson.time = t;
@@ -430,10 +415,8 @@ function parseLessonCell(
   return lesson;
 }
 
-/**
- * Fetch a schedule from isuct.ru by submitting the studschedule_form.
- * Returns null on any failure (network, parse) so the store can fall back.
- */
+// ─── Schedule fetching ──────────────────────────────────────────
+
 export async function fetchLiveSchedule(
   type: ScheduleType,
   id: string,
@@ -443,15 +426,23 @@ export async function fetchLiveSchedule(
   try {
     const ctx = await getFormContext();
     if (!ctx) return null;
+
+    // KEY FIX: The idgrid/idprepid/idaudid field expects a NUMERIC ID from
+    // autocomplete. When autocomplete is unavailable, pass EMPTY string "".
+    // The hidden field starts empty in the HTML form, and Drupal accepts
+    // an empty ID — it falls back to looking up by the text field (idgr).
+    const numericId = /^\d+$/.test(id) ? id : "";
+
     const body = new URLSearchParams({
       type: TYPE_FIELD[type],
       [TEXT_FIELD[type]]: name,
-      [ID_FIELD[type]]: id,
+      [ID_FIELD[type]]: numericId,  // empty string if not numeric
       form_build_id: ctx.buildId,
       form_id: "studschedule_form",
       op: "Показать расписание",
     });
-    const { signal, clear } = withTimeout(7000);
+
+    const { signal, clear } = withTimeout(20000); // 20 seconds (was 7)
     const res = await fetch(SCHEDULE_BASE_URL, {
       method: "POST",
       headers: {
@@ -474,7 +465,11 @@ export async function fetchLiveSchedule(
     }
     const html = await res.text();
     const parsed = parseScheduleHtml(html, type, name, id, semesterStart);
-    if (!parsed) recordFailure();
+    if (parsed) {
+      recordSuccess();
+    } else {
+      recordFailure();
+    }
     return parsed;
   } catch {
     recordFailure();
@@ -484,8 +479,6 @@ export async function fetchLiveSchedule(
 
 // ─── Validation ─────────────────────────────────────────────────
 
-/** Validate that a group/teacher/auditorium name matches the expected format.
- *  Returns an error message if invalid, null if valid. */
 export function validateQuery(type: ScheduleType, query: string): string | null {
   const q = query.trim();
   if (!q) return "Введите текст для поиска";
