@@ -7,19 +7,29 @@ import { popDueReminders } from "@/lib/bot/reminders";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const ADMIN_USERNAME = "jamqwr";
+
 interface TgChat {
   id: number;
   type: string;
+}
+interface TgUser {
+  id: number;
+  username?: string;
+  first_name?: string;
+  last_name?: string;
 }
 interface TgCallback {
   id: string;
   data?: string;
   message?: { message_id: number; chat: TgChat; text?: string };
+  from?: TgUser;
 }
 interface TgMessage {
   message_id: number;
   chat: TgChat;
   text?: string;
+  from?: TgUser;
 }
 interface TgUpdate {
   update_id: number;
@@ -52,6 +62,7 @@ export async function POST(req: NextRequest) {
   let input: BotInput | null = null;
   let callbackId: string | null = null;
   let editMessageId: number | null = null;
+  let username: string | null = null;
 
   if (update.callback_query) {
     const cq = update.callback_query;
@@ -60,11 +71,18 @@ export async function POST(req: NextRequest) {
       chatId = cq.message.chat.id;
       editMessageId = cq.message.message_id;
     }
+    if (cq.from?.username) username = cq.from.username;
     input = { kind: "callback", data: cq.data || "" };
   } else if (update.message) {
     chatId = update.message.chat.id;
+    if (update.message.from?.username) username = update.message.from.username;
     const text = update.message.text || "";
-    input = text === "/start" ? { kind: "start" } : { kind: "text", text };
+    // Treat "▶ Начать" button press as /start
+    if (text === "▶ Начать" || text === "/start") {
+      input = { kind: "start" };
+    } else {
+      input = { kind: "text", text };
+    }
   } else if (update.edited_message) {
     return NextResponse.json({ ok: true, ignored: true });
   }
@@ -75,10 +93,38 @@ export async function POST(req: NextRequest) {
 
   const session = getSession(String(chatId));
   session.__chatId = String(chatId);
+  // Set admin flag based on Telegram username
+  session.__isAdmin = username === ADMIN_USERNAME;
+
   const reply = await processInput(input, session);
   saveSession(String(chatId), reply.session);
 
+  // Send reply with optional reply keyboard
   await sendBotReply(token, chatId, reply, { callbackId, editMessageId });
+
+  // If the reply includes a reply keyboard, send it separately
+  if (reply.replyKeyboard) {
+    await tgCall(token, "sendMessage", {
+      chat_id: chatId,
+      text: "👇 Нажми кнопку, чтобы начать",
+      reply_markup: {
+        keyboard: reply.replyKeyboard.map((row) =>
+          row.map((text) => ({ text })),
+        ),
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    });
+  }
+
+  // If the reply asks to remove the reply keyboard
+  if (reply.removeReplyKeyboard) {
+    await tgCall(token, "sendMessage", {
+      chat_id: chatId,
+      text: "✅",
+      reply_markup: { remove_keyboard: true },
+    }).catch(() => {});
+  }
 
   // Fire any due reminders for this chat (best-effort, non-blocking).
   fireDueRemindersForChat(token, String(chatId)).catch(() => {});

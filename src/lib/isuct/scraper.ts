@@ -481,3 +481,28 @@ export async function fetchLiveSchedule(
     return null;
   }
 }
+
+// ─── Validation ─────────────────────────────────────────────────
+
+/** Validate that a group/teacher/auditorium name matches the expected format.
+ *  Returns an error message if invalid, null if valid. */
+export function validateQuery(type: ScheduleType, query: string): string | null {
+  const q = query.trim();
+  if (!q) return "Введите текст для поиска";
+
+  if (type === "group") {
+    if (q.length < 2) {
+      return "Номер группы слишком короткий. Пример: 2/25, ХТ-21";
+    }
+  } else if (type === "teacher") {
+    if (q.length < 3) {
+      return "Введите фамилию преподавателя (минимум 3 символа). Пример: Смирнов";
+    }
+  } else if (type === "auditorium") {
+    if (q.length < 2) {
+      return "Введите номер аудитории (минимум 2 символа). Пример: Г203";
+    }
+  }
+
+  return null;
+}

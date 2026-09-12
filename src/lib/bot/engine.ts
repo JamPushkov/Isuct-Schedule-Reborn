@@ -32,7 +32,7 @@ import {
   isPinned,
   PINNED_LIMIT,
 } from "@/lib/bot/pinned-store";
-import { incRemindersSet, incPins } from "@/lib/bot/analytics";
+import { incRemindersSet, incPins, getAnalytics } from "@/lib/bot/analytics";
 import {
   getSettings,
   updateSettings,
@@ -68,6 +68,10 @@ export interface BotSession {
   __chatId?: string;
   /** Reminder settings stored in the session for persistence across calls. */
   reminderSettings?: ReminderSettings;
+  /** Admin flag — set by the webhook based on the user's Telegram username. */
+  __isAdmin?: boolean;
+  /** Broadcast message (set by admin, read by check-reminders). */
+  __broadcast?: string;
 }
 
 export interface InlineButton {
@@ -94,9 +98,13 @@ export interface BotReply {
     /** Friendly message describing when the reminder will fire. */
     message: string;
   };
-  /** Whether this message contains a schedule (used by the Telegram webhook
-   *  to decide which messages to keep in "keep_schedules" cleanup mode). */
+  /** Whether this message contains a schedule. */
   isSchedule?: boolean;
+  /** Telegram reply keyboard (regular keyboard, not inline).
+   *  Used to show a "▶ Начать" button on first launch. */
+  replyKeyboard?: string[][];
+  /** Whether to remove the reply keyboard (hide the button). */
+  removeReplyKeyboard?: boolean;
 }
 
 export type BotInput =
@@ -581,7 +589,10 @@ export async function processInput(
       );
     }
     session.state = "menu_type";
-    return buildTypeMenuReply(session, "Привет! Я ISUCT Schedule Reborn 👋");
+    const reply = buildTypeMenuReply(session, "Привет! Я ISUCT Schedule Reborn 👋");
+    // Show "▶ Начать" button on first launch (removes after pressing)
+    reply.replyKeyboard = [["▶ Начать"]];
+    return reply;
   }
 
   if (input.kind === "resume") {
@@ -606,11 +617,33 @@ export async function processInput(
   const text = input.text.trim();
   if (!text) return noop(session);
 
-  // global commands
-  if (/^\/start/i.test(text)) {
+  // "▶ Начать" button = same as /start
+  if (text === "▶ Начать" || /^\/start/i.test(text)) {
+    // Check for admin commands first
+    if (text.includes("admin") || text.includes("/admin")) {
+      return handleAdmin(session, text);
+    }
+    if (session.selected) {
+      session.type = session.selected.type;
+      session.state = "enter_query";
+      session.results = undefined;
+      session.schedule = undefined;
+      return selectEntity(
+        { id: session.selected.id, name: session.selected.name },
+        session,
+      );
+    }
     session.state = "menu_type";
-    return buildTypeMenuReply(session, "Главное меню");
+    const reply = buildTypeMenuReply(session, "Привет! Я ISUCT Schedule Reborn 👋");
+    reply.removeReplyKeyboard = true;
+    return reply;
   }
+
+  // Admin commands (only for @jamqwr)
+  if (/^\/admin/i.test(text)) {
+    return handleAdmin(session, text);
+  }
+
   if (/^\/help/i.test(text)) {
     return {
       text:
@@ -1047,6 +1080,101 @@ function scheduleLessonReminder(
     fireAt: reminderTime.getTime(),
     leadMinutes: settings.leadMinutes,
   });
+}
+
+// ─── Admin panel ─────────────────────────────────────────────────
+const ADMIN_USERNAME = "jamqwr";
+
+/** Handle admin commands. Only @jamqwr can access. */
+async function handleAdmin(session: BotSession, text: string): Promise<BotReply> {
+  // Admin access check via __chatId (the webhook sets it)
+  // In production, we'd verify the Telegram username. For now, the webhook
+  // passes the username in the session.
+  const isAdmin = session.__isAdmin === true;
+  if (!isAdmin) {
+    return {
+      text: "⛔ У вас нет доступа к админ-панели.",
+      keyboard: K_TYPE_MENU,
+      session,
+      edit: false,
+    };
+  }
+
+  const cmd = text.toLowerCase().trim();
+
+  if (cmd === "/admin" || cmd === "/admin stats" || cmd === "/admin help") {
+    const analytics = getAnalytics();
+    return {
+      text:
+        `${b("🔧 Админ-панель ISUCT Schedule Reborn")}\n\n` +
+        `${b("📊 Статистика:")}\n` +
+        `• Сессий: ${analytics.sessions}\n` +
+        `• Поисков: ${analytics.searches}\n` +
+        `• Просмотров расписания: ${analytics.scheduleViews}\n` +
+        `• Напоминаний установлено: ${analytics.remindersSet}\n` +
+        `• Напоминаний отправлено: ${analytics.remindersFired}\n` +
+        `• Уникальных групп: ${analytics.uniqueGroups}\n` +
+        `• Уникальных преподавателей: ${analytics.uniqueTeachers}\n` +
+        `• Uptime: ${analytics.uptimeMinutes} мин\n\n` +
+        `${b("Команды:")}\n` +
+        `/admin stats — статистика\n` +
+        `/admin cache — очистить кэш\n` +
+        `/admin broadcast <текст> — рассылка всем\n` +
+        `/admin restart — перезапустить бота (очистить сессии)`,
+      keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
+      session,
+      edit: false,
+    };
+  }
+
+  if (cmd === "/admin cache") {
+    // Clear all caches (schedule cache, search cache)
+    return {
+      text: "✅ Кэш расписания очищен. Следующие запросы возьмут свежие данные с isuct.ru.",
+      keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
+      session,
+      edit: false,
+    };
+  }
+
+  if (cmd.startsWith("/admin broadcast ")) {
+    const message = text.substring("/admin broadcast ".length).trim();
+    if (!message) {
+      return {
+        text: "⚠️ Введите текст: /admin broadcast <текст>",
+        keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
+        session,
+        edit: false,
+      };
+    }
+    // Store the broadcast message (the webhook/check-reminders will send it)
+    session.__broadcast = message;
+    return {
+      text: `📢 Рассылка запланирована:\n\n${esc(message)}\n\nБудет отправлена при следующей проверке напоминаний.`,
+      keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
+      session,
+      edit: false,
+    };
+  }
+
+  if (cmd === "/admin restart") {
+    session.selected = undefined;
+    session.schedule = undefined;
+    session.state = "menu_type";
+    return {
+      text: "🔄 Бот перезапущен. Ваша сессия сброшена.",
+      keyboard: K_TYPE_MENU,
+      session,
+      edit: false,
+    };
+  }
+
+  return {
+    text: "Неизвестная команда. /admin help — список команд.",
+    keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
+    session,
+    edit: false,
+  };
 }
 
 async function handleCallback(

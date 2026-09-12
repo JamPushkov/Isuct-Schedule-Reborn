@@ -2,7 +2,7 @@
 // This is the single entry point the bot engine and API routes use.
 
 import type { FullSchedule, ScheduleType, SearchEntry, WeekParity } from "./types";
-import { computeCurrentParity, fetchLiveSchedule, searchLive } from "./scraper";
+import { computeCurrentParity, fetchLiveSchedule, searchLive, validateQuery } from "./scraper";
 import { generateSampleSchedule, searchSample } from "./sample-data";
 import { incSearches, incScheduleViews } from "@/lib/bot/analytics";
 
@@ -49,7 +49,16 @@ export async function searchSchedule(
   if (cached) return cached;
 
   const live = await searchLive(type, query);
-  const result = live.length ? live : searchSample(type, query);
+  let result = live.length ? live : searchSample(type, query);
+
+  // If nothing found but format is valid, let the user proceed with their input.
+  // The ISUCT autocomplete may be unreachable from Vercel, but the group
+  // still exists on isuct.ru — the schedule fetch will try to get real data.
+  if (result.length === 0 && !validateQuery(type, query)) {
+    const q = query.trim();
+    result = [{ id: q, name: q }];
+  }
+
   setCache(key, result, 5 * 60 * 1000);
   return result;
 }
