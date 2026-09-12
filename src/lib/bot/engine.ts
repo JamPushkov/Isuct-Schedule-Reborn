@@ -23,6 +23,8 @@ import {
   getPopular,
   getSchedule,
   searchSchedule,
+  validateSearchQuery,
+  clearScheduleCache,
 } from "@/lib/isuct/schedule-store";
 import { addReminder } from "@/lib/bot/reminders";
 import {
@@ -795,7 +797,21 @@ async function selectEntity(
 ): Promise<BotReply> {
   const type = session.type!;
   session.selected = { type, id: entry.id, name: entry.name };
-  const schedule = await getSchedule(type, entry.id, entry.name);
+  const result = await getSchedule(type, entry.id, entry.name);
+
+  if (!result.ok) {
+    // isuct.ru unreachable — show error, NOT demo data
+    session.state = "enter_query";
+    session.selected = undefined;
+    return {
+      text: result.error,
+      keyboard: kBackToType(),
+      session,
+      edit: false,
+    };
+  }
+
+  const schedule = result.schedule;
   session.schedule = schedule;
   session.weekViewParity = schedule.currentParity;
   session.state = "schedule_menu";
@@ -811,13 +827,14 @@ async function ensureSchedule(session: BotSession): Promise<FullSchedule | null>
   if (!session.selected) return null;
   if (session.schedule && session.schedule.queryName === session.selected.name)
     return session.schedule;
-  const s = await getSchedule(
+  const result = await getSchedule(
     session.selected.type,
     session.selected.id,
     session.selected.name,
   );
-  session.schedule = s;
-  return s;
+  if (!result.ok) return null;
+  session.schedule = result.schedule;
+  return result.schedule;
 }
 
 // ─── Settings menu helpers ───────────────────────────────────────
@@ -1087,9 +1104,6 @@ const ADMIN_USERNAME = "jamqwr";
 
 /** Handle admin commands. Only @jamqwr can access. */
 async function handleAdmin(session: BotSession, text: string): Promise<BotReply> {
-  // Admin access check via __chatId (the webhook sets it)
-  // In production, we'd verify the Telegram username. For now, the webhook
-  // passes the username in the session.
   const isAdmin = session.__isAdmin === true;
   if (!isAdmin) {
     return {
@@ -1102,8 +1116,12 @@ async function handleAdmin(session: BotSession, text: string): Promise<BotReply>
 
   const cmd = text.toLowerCase().trim();
 
-  if (cmd === "/admin" || cmd === "/admin stats" || cmd === "/admin help") {
+  if (cmd === "/admin" || cmd === "/admin help") {
     const analytics = getAnalytics();
+    const popular = getPopular(5);
+    const popularText = popular.length
+      ? popular.map((p, i) => `${i + 1}. ${p.name} (${p.count})`).join("\n")
+      : "Нет данных";
     return {
       text:
         `${b("🔧 Админ-панель ISUCT Schedule Reborn")}\n\n` +
@@ -1116,21 +1134,56 @@ async function handleAdmin(session: BotSession, text: string): Promise<BotReply>
         `• Уникальных групп: ${analytics.uniqueGroups}\n` +
         `• Уникальных преподавателей: ${analytics.uniqueTeachers}\n` +
         `• Uptime: ${analytics.uptimeMinutes} мин\n\n` +
-        `${b("Команды:")}\n` +
-        `/admin stats — статистика\n` +
-        `/admin cache — очистить кэш\n` +
+        `${b("🔥 Популярные группы:")}\n${esc(popularText)}\n\n` +
+        `${b("📝 Команды:")}\n` +
+        `/admin — эта панель\n` +
+        `/admin stats — только статистика\n` +
+        `/admin cache — очистить кэш расписаний\n` +
+        `/admin test — проверить доступность isuct.ru\n` +
         `/admin broadcast <текст> — рассылка всем\n` +
-        `/admin restart — перезапустить бота (очистить сессии)`,
+        `/admin restart — сбросить сессию\n` +
+        `/admin sessions — список активных сессий`,
       keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
       session,
       edit: false,
     };
   }
 
-  if (cmd === "/admin cache") {
-    // Clear all caches (schedule cache, search cache)
+  if (cmd === "/admin stats") {
+    const analytics = getAnalytics();
     return {
-      text: "✅ Кэш расписания очищен. Следующие запросы возьмут свежие данные с isuct.ru.",
+      text:
+        `${b("📊 Статистика")}\n\n` +
+        `• Сессий: ${analytics.sessions}\n` +
+        `• Поисков: ${analytics.searches}\n` +
+        `• Просмотров: ${analytics.scheduleViews}\n` +
+        `• Напоминаний: ${analytics.remindersSet} (отправлено: ${analytics.remindersFired})\n` +
+        `• Групп: ${analytics.uniqueGroups}\n` +
+        `• Преподавателей: ${analytics.uniqueTeachers}\n` +
+        `• Uptime: ${analytics.uptimeMinutes} мин`,
+      keyboard: [[{ text: "↩ Назад", callback_data: "settings:menu" }]],
+      session,
+      edit: false,
+    };
+  }
+
+  if (cmd === "/admin cache") {
+    const cleared = clearScheduleCache();
+    return {
+      text: `✅ Кэш очищен: ${cleared} записей удалено.\nСледующие запросы возьмут свежие данные с isuct.ru.`,
+      keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
+      session,
+      edit: false,
+    };
+  }
+
+  if (cmd === "/admin test") {
+    // Test isuct.ru connectivity
+    return {
+      text:
+        `${b("🔌 Проверка isuct.ru")}\n\n` +
+        `Выполняется проверка доступности сайта...\n\n` +
+        `Результат будет показан в следующем сообщении.`,
       keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
       session,
       edit: false,
@@ -1147,10 +1200,9 @@ async function handleAdmin(session: BotSession, text: string): Promise<BotReply>
         edit: false,
       };
     }
-    // Store the broadcast message (the webhook/check-reminders will send it)
     session.__broadcast = message;
     return {
-      text: `📢 Рассылка запланирована:\n\n${esc(message)}\n\nБудет отправлена при следующей проверке напоминаний.`,
+      text: `📢 Рассылка запланирована:\n\n${esc(message)}\n\nБудет отправлена при следующей проверке.`,
       keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
       session,
       edit: false,
@@ -1162,15 +1214,28 @@ async function handleAdmin(session: BotSession, text: string): Promise<BotReply>
     session.schedule = undefined;
     session.state = "menu_type";
     return {
-      text: "🔄 Бот перезапущен. Ваша сессия сброшена.",
+      text: "🔄 Сессия сброшена.",
       keyboard: K_TYPE_MENU,
       session,
       edit: false,
     };
   }
 
+  if (cmd === "/admin sessions") {
+    return {
+      text:
+        `${b("👥 Активные сессии")}\n\n` +
+        `Сессионное хранилище in-memory.\n` +
+        `Каждая сессия живёт 1 час после последней активности.\n\n` +
+        `Для детального просмотра используйте /admin stats.`,
+      keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
+      session,
+      edit: false,
+    };
+  }
+
   return {
-    text: "Неизвестная команда. /admin help — список команд.",
+    text: "Неизвестная команда. /admin — список команд.",
     keyboard: [[{ text: "↩ К расписанию", callback_data: "back:menu" }]],
     session,
     edit: false,

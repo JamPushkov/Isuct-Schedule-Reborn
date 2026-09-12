@@ -21,6 +21,10 @@ const EXCLUDE_DIRS = new Set([
   ".zscripts",
   "skills",
   "db",
+  "upload",
+  ".claude",
+  ".z-ai-config",
+  "mini-services/node_modules",
 ]);
 
 const EXCLUDE_FILES = new Set([

@@ -1,5 +1,6 @@
-// Schedule store: in-memory cache + live-scrape with automatic sample fallback.
-// This is the single entry point the bot engine and API routes use.
+// Schedule store: in-memory cache + live-scrape.
+// When isuct.ru is unreachable, returns an error (NOT sample data).
+// The bot shows an error message to the user instead of fake schedule.
 
 import type { FullSchedule, ScheduleType, SearchEntry, WeekParity } from "./types";
 import { computeCurrentParity, fetchLiveSchedule, searchLive, validateQuery } from "./scraper";
@@ -28,16 +29,21 @@ function getCache<T>(key: string): T | null {
 
 function setCache<T>(key: string, value: T, ttl = TTL_MS) {
   cache.set(key, { value, expires: Date.now() + ttl });
-  // bound cache size
   if (cache.size > 500) {
     const firstKey = cache.keys().next().value;
     if (firstKey) cache.delete(firstKey);
   }
 }
 
+/** Validate a group/teacher/auditorium query format. */
+export function validateSearchQuery(type: ScheduleType, query: string): string | null {
+  return validateQuery(type, query);
+}
+
 /**
  * Search groups / teachers / auditoriums.
  * Tries live autocomplete first, falls back to curated sample list.
+ * If nothing found and format is valid, returns the query itself as a result.
  */
 export async function searchSchedule(
   type: ScheduleType,
@@ -52,8 +58,6 @@ export async function searchSchedule(
   let result = live.length ? live : searchSample(type, query);
 
   // If nothing found but format is valid, let the user proceed with their input.
-  // The ISUCT autocomplete may be unreachable from Vercel, but the group
-  // still exists on isuct.ru — the schedule fetch will try to get real data.
   if (result.length === 0 && !validateQuery(type, query)) {
     const q = query.trim();
     result = [{ id: q, name: q }];
@@ -64,39 +68,46 @@ export async function searchSchedule(
 }
 
 /**
+ * Result of getSchedule — either a real schedule or an error.
+ */
+export type ScheduleResult =
+  | { ok: true; schedule: FullSchedule }
+  | { ok: false; error: string };
+
+/**
  * Get the full schedule for a group / teacher / auditorium.
- * Tries live scrape first; on failure returns a deterministic sample schedule
- * (always flagged `source: 'sample'`) so the bot never breaks.
+ * Tries live scrape. If isuct.ru is unreachable, returns an error
+ * (does NOT fall back to sample data — user sees an error message).
  */
 export async function getSchedule(
   type: ScheduleType,
   id: string,
   name: string,
-): Promise<FullSchedule> {
+): Promise<ScheduleResult> {
   incScheduleViews();
   const key = `sched:${type}:${id}:${name}`;
   const cached = getCache<FullSchedule>(key);
   if (cached) {
     recordView(type, id, name);
-    return cached;
+    return { ok: true, schedule: cached };
   }
-
-  const currentParity = computeCurrentParity(SEMESTOR_START, "II");
 
   const live = await fetchLiveSchedule(type, id, name, SEMESTOR_START);
   if (live) {
     setCache(key, live);
     recordView(type, id, name);
-    return live;
+    return { ok: true, schedule: live };
   }
 
-  // Fallback: deterministic sample, but keep the real query name.
-  const sample = generateSampleSchedule(type, name, SEMESTOR_START, currentParity);
-  sample.queryId = id;
-  sample.liveError = "Сайт isuct.ru недоступен — показано демонстрационное расписание";
-  setCache(key, sample, 2 * 60 * 1000); // short TTL so live retries sooner
-  recordView(type, id, name);
-  return sample;
+  // No fallback to sample data — return error
+  return {
+    ok: false,
+    error: "⚠️ Не удалось получить расписание с сайта университета (isuct.ru).\n\n" +
+      "Возможные причины:\n" +
+      "• Сайт временно недоступен\n" +
+      "• Группа/преподаватель не найдены\n\n" +
+      "Попробуйте позже или проверьте правильность ввода.",
+  };
 }
 
 export function getCurrentParity(): WeekParity {
@@ -107,11 +118,19 @@ export function getSemesterStart(): string {
   return SEMESTOR_START;
 }
 
+/** Clear all cached schedules (admin command). */
+export function clearScheduleCache(): number {
+  let count = 0;
+  for (const key of cache.keys()) {
+    if (key.startsWith("sched:") || key.startsWith("search:")) {
+      cache.delete(key);
+      count++;
+    }
+  }
+  return count;
+}
+
 // ─── Popularity stats ─────────────────────────────────────────────
-// Tracks how many times each group/teacher/auditorium has been viewed.
-// Used to show "Популярные" suggestions on the start screen so new users
-// can pick a common group without typing. In-memory only (resets on
-// restart); for multi-instance deployments, swap with Redis.
 
 interface StatsEntry {
   type: ScheduleType;
@@ -121,26 +140,21 @@ interface StatsEntry {
   lastUsed: number;
 }
 
-const stats = new Map<string, StatsEntry>(); // key = `${type}:${id}`
+const stats = new Map<string, StatsEntry>();
 
-/** Record a view — called whenever a schedule is fetched. */
 export function recordView(type: ScheduleType, id: string, name: string) {
   const key = `${type}:${id}`;
   const existing = stats.get(key);
   if (existing) {
     existing.count++;
     existing.lastUsed = Date.now();
-    existing.name = name; // update in case display name changed
+    existing.name = name;
   } else {
     stats.set(key, { type, id, name, count: 1, lastUsed: Date.now() });
   }
 }
 
-/** Get the top-N most-viewed entities across all types. */
 export function getPopular(limit = 6): StatsEntry[] {
-  // Deduplicate by name+type (same group can be recorded under different IDs
-  // when selected via different paths — e.g. sample-search id vs engine pick
-  // id). Keep the highest-count entry per name+type, merging counts.
   const merged = new Map<string, StatsEntry>();
   for (const e of stats.values()) {
     const k = `${e.type}:${e.name}`;
@@ -151,7 +165,7 @@ export function getPopular(limit = 6): StatsEntry[] {
       cur.count += e.count;
       if (e.lastUsed > cur.lastUsed) {
         cur.lastUsed = e.lastUsed;
-        cur.id = e.id; // prefer most-recently-used id
+        cur.id = e.id;
       }
     }
   }
@@ -160,9 +174,7 @@ export function getPopular(limit = 6): StatsEntry[] {
     .slice(0, limit);
 }
 
-/** Get the top-N most-viewed entities of a specific type. */
 export function getPopularByType(type: ScheduleType, limit = 4): StatsEntry[] {
-  // Same dedup-by-name logic, scoped to one type.
   const merged = new Map<string, StatsEntry>();
   for (const e of stats.values()) {
     if (e.type !== type) continue;
