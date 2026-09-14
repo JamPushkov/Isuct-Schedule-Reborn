@@ -1,11 +1,3 @@
-// Production-ready ISUCT schedule scraper.
-//
-// Key fixes:
-// 1. Circuit breaker cooldown reduced to 30 seconds (was 5 minutes — too aggressive)
-// 2. Timeouts increased (15s GET, 20s POST — isuct.ru is a slow Drupal site)
-// 3. ID field: pass empty string when ID is not numeric (autocomplete returns empty)
-// 4. Better HTML parsing: look for schedule tables in the full page, not just #form-ajax-node-content
-
 import * as cheerio from "cheerio";
 import type {
   DaySchedule,
@@ -18,8 +10,11 @@ import type {
 } from "./types";
 import { SCHEDULE_BASE_URL } from "./types";
 
+const ISUCT_ORIGIN = "https://www.isuct.ru";
+const AJAX_URL = `${ISUCT_ORIGIN}/system/ajax`;
+
 const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0 Safari/537.36";
 
 const AUTOCOMPLETE_PATH: Record<ScheduleType, string> = {
   group: "currentstudentsgroups",
@@ -45,78 +40,191 @@ const ID_FIELD: Record<ScheduleType, string> = {
   auditorium: "idaudid",
 };
 
+const DAY_LOOKUP: Record<string, WeekDayIndex> = {
+  понедельник: 1,
+  вторник: 2,
+  среда: 3,
+  среду: 3,
+  четверг: 4,
+  пятница: 5,
+  пятницу: 5,
+  суббота: 6,
+  воскресенье: 7,
+
+  пн: 1,
+  вт: 2,
+  ср: 3,
+  чт: 4,
+  пт: 5,
+  сб: 6,
+  вс: 7,
+};
+
 function withTimeout(ms: number) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  return { signal: ctrl.signal, clear: () => clearTimeout(t) };
+  const controller = new AbortController();
+
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, ms);
+
+  return {
+    signal: controller.signal,
+    clear: () => clearTimeout(timer),
+  };
 }
 
-// ─── Circuit breaker ───────────────────────────────────────────────
-// Short cooldown (30 sec) — if isuct.ru is temporarily down, we retry
-// quickly. The old 5-minute cooldown was too aggressive: users had to
-// wait 5 minutes after a single failure to get real data again.
+// ─────────────────────────────────────────────────────────────
+// Circuit breaker
+// ─────────────────────────────────────────────────────────────
 
-const CB_OPEN_MS = 30 * 1000; // 30 seconds (was 5 minutes)
+const CB_OPEN_MS = 30_000;
+
 let cbLastFailure = 0;
 let cbProbeInflight = false;
 
 function circuitOpen(): boolean {
   if (cbProbeInflight) return false;
+
   return Date.now() - cbLastFailure < CB_OPEN_MS;
 }
+
 function recordFailure() {
   cbLastFailure = Date.now();
 }
+
 function recordSuccess() {
-  cbLastFailure = 0; // reset on success
+  cbLastFailure = 0;
 }
+
 function startProbe() {
   cbProbeInflight = true;
 }
+
 function endProbe() {
   cbProbeInflight = false;
 }
+
+// ─────────────────────────────────────────────────────────────
+// HTTP session / form context
+// ─────────────────────────────────────────────────────────────
 
 interface FormContext {
   buildId: string;
   cookie: string;
 }
 
-/** GET the schedule page and extract a fresh form_build_id + session cookie. */
+/**
+ * Extract Set-Cookie headers in a way that works on Node/Vercel
+ * as well as possible without requiring a special cookie library.
+ */
+function extractCookies(headers: Headers): string {
+  const anyHeaders = headers as Headers & {
+    getSetCookie?: () => string[];
+  };
+
+  const setCookies =
+    typeof anyHeaders.getSetCookie === "function"
+      ? anyHeaders.getSetCookie()
+      : [];
+
+  if (setCookies.length > 0) {
+    return setCookies
+      .map((cookie) => cookie.split(";")[0].trim())
+      .filter(Boolean)
+      .join("; ");
+  }
+
+  const single = headers.get("set-cookie");
+
+  if (!single) {
+    return "";
+  }
+
+  /*
+   * Fallback for environments where getSetCookie() is unavailable.
+   * We mainly need the first cookie pair(s), not cookie attributes.
+   */
+  return single
+    .split(/,(?=[^;,]+=)/)
+    .map((cookie) => cookie.split(";")[0].trim())
+    .filter(Boolean)
+    .join("; ");
+}
+
+/**
+ * GET /student/schedule
+ *
+ * We need:
+ *   - fresh form_build_id
+ *   - cookies from the same HTTP session
+ */
 export async function getFormContext(): Promise<FormContext | null> {
-  if (circuitOpen()) return null;
+  if (circuitOpen()) {
+    return null;
+  }
+
   startProbe();
+
   try {
-    const { signal, clear } = withTimeout(15000); // 15 seconds (was 5)
-    const res = await fetch(SCHEDULE_BASE_URL, {
+    const { signal, clear } = withTimeout(30_000);
+
+    const response = await fetch(SCHEDULE_BASE_URL, {
+      method: "GET",
+      redirect: "follow",
+      signal,
+
       headers: {
         "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml",
+        "Accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
       },
-      signal,
-      redirect: "follow",
     });
+
     clear();
-    if (!res.ok) {
+
+    if (!response.ok) {
+      console.error(
+        `[ISUCT] GET schedule page failed: ${response.status} ${response.statusText}`,
+      );
+
       recordFailure();
       return null;
     }
-    const html = await res.text();
-    const setCookie = res.headers.get("set-cookie") || "";
-    const cookie = setCookie.split(";")[0];
+
+    const html = await response.text();
+    const cookie = extractCookies(response.headers);
+
     const $ = cheerio.load(html);
+
     const buildId =
       $('input[name="form_build_id"]').attr("value") ||
-      html.match(/name="form_build_id"\s+value="([^"]+)"/)?.[1] ||
+      html.match(
+        /name=["']form_build_id["'][^>]*value=["']([^"']+)["']/i,
+      )?.[1] ||
       "";
+
     if (!buildId) {
+      console.error("[ISUCT] form_build_id was not found");
+
       recordFailure();
       return null;
     }
+
+    console.log(
+      `[ISUCT] form context received: buildId=${buildId}, cookie=${cookie ? "yes" : "no"}`,
+    );
+
     recordSuccess();
-    return { buildId, cookie };
-  } catch {
+
+    return {
+      buildId,
+      cookie,
+    };
+  } catch (error) {
+    console.error("[ISUCT] getFormContext error:", error);
+
     recordFailure();
     return null;
   } finally {
@@ -124,120 +232,791 @@ export async function getFormContext(): Promise<FormContext | null> {
   }
 }
 
-// ─── Autocomplete ────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Autocomplete
+// ─────────────────────────────────────────────────────────────
 
 function parseAutocomplete(json: string): SearchEntry[] {
-  const out: SearchEntry[] = [];
+  const result: SearchEntry[] = [];
+
   try {
     const data = JSON.parse(json);
+
     if (Array.isArray(data)) {
       for (const item of data) {
         if (typeof item === "string") {
-          out.push({ id: item, name: item });
-        } else if (item && typeof item === "object") {
-          const label = String(item.label ?? item.value ?? item.name ?? "").trim();
-          const value = String(item.value ?? item.id ?? "").trim();
-          if (!label) continue;
-          const idMatch = value.match(/\[id:(\d+)\]/) || label.match(/\[(\d+)\]/);
-          const id = idMatch ? idMatch[1] : value;
-          out.push({ id, name: label.replace(/\s*\[.*?\]\s*$/, "") });
+          const value = item.trim();
+
+          if (value) {
+            result.push({
+              id: value,
+              name: value,
+            });
+          }
+
+          continue;
+        }
+
+        if (item && typeof item === "object") {
+          const obj = item as Record<string, unknown>;
+
+          const rawLabel = String(
+            obj.label ??
+              obj.value ??
+              obj.name ??
+              "",
+          ).trim();
+
+          const rawValue = String(
+            obj.value ??
+              obj.id ??
+              "",
+          ).trim();
+
+          if (!rawLabel) continue;
+
+          /*
+           * Possible autocomplete formats:
+           *
+           *   { label, value, id }
+           *   "2/278 [22852]"
+           *   "2/278|22852"
+           */
+          const pipe = rawLabel.match(/^(.+?)\s*\|\s*(\d+)$/);
+
+          if (pipe) {
+            result.push({
+              id: pipe[2],
+              name: pipe[1].trim(),
+            });
+
+            continue;
+          }
+
+          const bracket =
+            rawValue.match(/^\[?id[:\s]*(\d+)\]?$/i) ||
+            rawLabel.match(/\[id[:\s]*(\d+)\]/i) ||
+            rawLabel.match(/\[(\d+)\]/);
+
+          const id = bracket?.[1] ?? rawValue;
+
+          result.push({
+            id,
+            name: rawLabel.replace(/\s*\[.*?\]\s*$/, "").trim(),
+          });
         }
       }
-    } else if (data && typeof data === "object") {
+    } else if (
+      data &&
+      typeof data === "object"
+    ) {
       for (const [id, name] of Object.entries(data)) {
-        out.push({ id, name: String(name) });
+        result.push({
+          id: String(id),
+          name: String(name).trim(),
+        });
       }
     }
-  } catch {
-    /* ignore */
+  } catch (error) {
+    console.error("[ISUCT] autocomplete JSON parse failed:", error);
   }
-  return out;
+
+  return result;
 }
 
-/** Search groups / teachers / auditoriums via the isuct.ru autocomplete. */
 export async function searchLive(
   type: ScheduleType,
   query: string,
 ): Promise<SearchEntry[]> {
   const q = query.trim();
-  if (!q) return [];
-  if (circuitOpen()) return [];
+
+  if (!q || circuitOpen()) {
+    return [];
+  }
+
   startProbe();
+
   try {
-    const path = AUTOCOMPLETE_PATH[type];
-    const url = `https://www.isuct.ru/student/schedule/${path}/${encodeURIComponent(q)}`;
-    const { signal, clear } = withTimeout(10000); // 10 seconds (was 4)
-    const res = await fetch(url, {
+    const endpoint =
+      `${ISUCT_ORIGIN}/student/schedule/` +
+      `${AUTOCOMPLETE_PATH[type]}/` +
+      encodeURIComponent(q);
+
+    const { signal, clear } = withTimeout(15_000);
+
+    const response = await fetch(endpoint, {
+      method: "GET",
+      redirect: "follow",
+      signal,
+
       headers: {
         "User-Agent": UA,
-        Accept: "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
+        "Accept":
+          "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language":
+          "ru-RU,ru;q=0.9,en;q=0.8",
+        "X-Requested-With":
+          "XMLHttpRequest",
+        "Referer":
+          SCHEDULE_BASE_URL,
       },
-      signal,
     });
+
     clear();
-    if (!res.ok) {
+
+    if (!response.ok) {
+      console.error(
+        `[ISUCT] autocomplete failed: ${response.status}`,
+      );
+
       recordFailure();
       return [];
     }
-    const text = await res.text();
+
+    const text = await response.text();
     const parsed = parseAutocomplete(text);
-    if (parsed.length > 0) recordSuccess();
+
+    if (parsed.length > 0) {
+      recordSuccess();
+    }
+
     return parsed;
-  } catch {
+  } catch (error) {
+    console.error("[ISUCT] searchLive error:", error);
+
     recordFailure();
+
     return [];
   } finally {
     endProbe();
   }
 }
 
-// ─── Week parity ────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Week parity
+// ─────────────────────────────────────────────────────────────
 
 export function computeCurrentParity(
   semesterStartISO: string,
-  startParity: WeekParity = "II",
+  startParity: WeekParity = "I",
   now: Date = new Date(),
 ): WeekParity {
-  const start = new Date(semesterStartISO + "T00:00:00");
-  if (Number.isNaN(start.getTime())) return startParity;
-  const dayMs = 24 * 60 * 60 * 1000;
-  const startMonday = new Date(start);
-  startMonday.setDate(start.getDate() - ((start.getDay() + 6) % 7));
-  const nowMonday = new Date(now);
-  nowMonday.setDate(now.getDate() - ((now.getDay() + 6) % 7));
-  const weeks = Math.round((nowMonday.getTime() - startMonday.getTime()) / (7 * dayMs));
-  if (weeks < 0) return startParity;
-  return weeks % 2 === 0 ? startParity : startParity === "I" ? "II" : "I";
-}
+  const start = new Date(`${semesterStartISO}T00:00:00`);
 
-// ─── Schedule parsing ────────────────────────────────────────────
-
-const DAY_LOOKUP: Record<string, WeekDayIndex> = {
-  понедельник: 1, вторник: 2, среда: 3, среду: 3,
-  четверг: 4, пятница: 5, пятницу: 5, суббота: 6, воскресенье: 7,
-  пн: 1, вт: 2, ср: 3, чт: 4, пт: 5, сб: 6, вс: 7,
-};
-
-function detectDay(text: string): WeekDayIndex | null {
-  const t = text.toLowerCase().trim();
-  for (const key of Object.keys(DAY_LOOKUP)) {
-    if (t.includes(key)) return DAY_LOOKUP[key];
+  if (Number.isNaN(start.getTime())) {
+    return startParity;
   }
+
+  const startMonday = new Date(start);
+  startMonday.setHours(0, 0, 0, 0);
+
+  startMonday.setDate(
+    startMonday.getDate() -
+      ((startMonday.getDay() + 6) % 7),
+  );
+
+  const currentMonday = new Date(now);
+  currentMonday.setHours(0, 0, 0, 0);
+
+  currentMonday.setDate(
+    currentMonday.getDate() -
+      ((currentMonday.getDay() + 6) % 7),
+  );
+
+  const diffMs =
+    currentMonday.getTime() -
+    startMonday.getTime();
+
+  const weeks = Math.floor(
+    diffMs / (7 * 24 * 60 * 60 * 1000),
+  );
+
+  if (weeks < 0) {
+    return startParity;
+  }
+
+  return weeks % 2 === 0
+    ? startParity
+    : startParity === "I"
+      ? "II"
+      : "I";
+}
+
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+
+function cleanText(value: string): string {
+  return value
+    .replace(/\u00a0/g, " ")
+    .replace(/\r/g, " ")
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectDay(value: string): WeekDayIndex | null {
+  const text = cleanText(value).toLowerCase();
+
+  for (const [name, day] of Object.entries(DAY_LOOKUP)) {
+    if (text.includes(name)) {
+      return day;
+    }
+  }
+
   return null;
 }
 
-function parseTime(text: string): string | null {
-  const m = text.match(/(\d{1,2}[:.]\d{2})\s*[-–—]\s*(\d{1,2}[:.]\d{2})/);
-  if (m) return `${m[1].replace(".", ":")}-${m[2].replace(".", ":")}`;
-  return null;
+function parseTime(value: string): string | null {
+  const match = value.match(
+    /(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})/,
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  const startH = match[1].padStart(2, "0");
+  const startM = match[2];
+
+  const endH = match[3].padStart(2, "0");
+  const endM = match[4];
+
+  return `${startH}:${startM}-${endH}:${endM}`;
 }
 
-function cleanText(s: string): string {
-  return s.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+function emptyWeek(parity: WeekParity) {
+  return {
+    parity,
+    days: [1, 2, 3, 4, 5, 6, 7].map(
+      (day) => ({
+        day: day as WeekDayIndex,
+        lessons: [],
+      }),
+    ),
+  };
 }
 
+function decodeHtmlEntities(value: string): string {
+  const $ = cheerio.load(`<span>${value}</span>`, {
+    decodeEntities: true,
+  });
+
+  return cleanText($("span").text());
+}
+
+function detectLessonType(
+  text: string,
+): Lesson["type"] | undefined {
+  const value = text.toLowerCase();
+
+  if (/\bлаб\.?|\bлаб\b|\bлаборатор/.test(value)) {
+    return "лаб";
+  }
+
+  if (/\bлек\.?|\bлек\b|\bлекция/.test(value)) {
+    return "лек";
+  }
+
+  if (/\bпр\.\s*з\.?|\bпракти/.test(value)) {
+    return "прак";
+  }
+
+  if (/\bзач/.test(value)) {
+    return "зач";
+  }
+
+  if (/\bэкз/.test(value)) {
+    return "экз";
+  }
+
+  if (/\bкурсов/.test(value)) {
+    return "кр";
+  }
+
+  return undefined;
+}
+
+function extractTeacher(text: string): string | undefined {
+  /*
+   * Examples from the real ISUCT response:
+   *
+   * Нестеренко А.С.
+   * Марчук Н.А.
+   * Некрасова В.Н.
+   * Кулакова С.В.
+   *
+   * We intentionally search everywhere, not only at end of line.
+   */
+  const match = text.match(
+    /\b[А-ЯЁ][а-яё-]+\s+[А-ЯЁ]\.[А-ЯЁ]\.?\b/u,
+  );
+
+  return match?.[0];
+}
+
+function extractPlace(text: string): string | undefined {
+  /*
+   * Examples:
+   * Л309
+   * Л201
+   * К205
+   * К103
+   * К307
+   * А26
+   * спортзал
+   */
+  const match = text.match(
+    /\b(?:[А-ЯЁA-Z]{1,3}\s*[-]?\s*\d{1,4}[А-ЯЁA-Z]?|спортзал)\b/u,
+  );
+
+  return match?.[0]?.replace(/\s+/g, "");
+}
+
+function extractDateRange(
+  text: string,
+): { from?: string; to?: string } {
+  const match = text.match(
+    /с\s+(\d{2}\.\d{2}\.\d{4})\s+по\s+(\d{2}\.\d{2}\.\d{4})/i,
+  );
+
+  if (!match) {
+    return {};
+  }
+
+  return {
+    from: match[1],
+    to: match[2],
+  };
+}
+
+function extractSubgroup(
+  text: string,
+): string | undefined {
+  const match =
+    text.match(/([12])\s*п\/г/i) ||
+    text.match(/([12])\s*подгруп/i);
+
+  if (!match) {
+    return undefined;
+  }
+
+  return `${match[1]} п/г`;
+}
+
+/**
+ * The actual schedule cell looks like:
+ *
+ *   Технология программирования Нестеренко А.С. лаб. Л309
+ *   с 09.09.2026 по 30.12.2026
+ *
+ * or:
+ *
+ *   Основы военной подготовки ... Куранова Н.Н. лк. В201
+ *   с 07.09.2026 по 28.12.2026
+ */
+function parseLessonCell(
+  $: cheerio.CheerioAPI,
+  cell: cheerio.AnyNode,
+  time: string,
+): Lesson | null {
+  const $cell = $(cell);
+
+  const rawHtml = $cell.html() || "";
+  const fullText = cleanText($cell.text());
+
+  if (
+    !fullText ||
+    fullText === "-" ||
+    fullText === "—"
+  ) {
+    return null;
+  }
+
+  const lines = rawHtml
+    .split(/<br\s*\/?>/gi)
+    .map((line) => {
+      const fragment = cheerio.load(
+        `<div>${line}</div>`,
+        { decodeEntities: true },
+      );
+
+      return cleanText(
+        fragment("div").text(),
+      );
+    })
+    .filter(Boolean);
+
+  const mainText = cleanText(
+    lines[0] || fullText,
+  );
+
+  if (!mainText || mainText === "&nbsp;") {
+    return null;
+  }
+
+  const lesson: Lesson = {
+    time,
+    subject: mainText,
+  };
+
+  const combined = cleanText(
+    lines.join(" "),
+  );
+
+  lesson.type = detectLessonType(combined);
+
+  const teacher = extractTeacher(mainText);
+  if (teacher) {
+    lesson.teacher = teacher;
+  }
+
+  const place =
+    extractPlace(mainText) ||
+    extractPlace(combined);
+
+  if (place) {
+    lesson.place = place;
+  }
+
+  const subgroup = extractSubgroup(combined);
+  if (subgroup) {
+    lesson.subgroup = subgroup;
+  }
+
+  const dates = extractDateRange(combined);
+
+  if (dates.from && dates.to) {
+    lesson.weeks =
+      `с ${dates.from} по ${dates.to}`;
+  }
+
+  /*
+   * Keep the subject clean.
+   *
+   * We remove teacher + type + room from the end where possible,
+   * while leaving the real subject intact.
+   */
+  let subject = mainText;
+
+  if (teacher) {
+    subject = subject.replace(teacher, " ");
+  }
+
+  if (lesson.type) {
+    const typePatterns = [
+      /\bлаб\.?\b/gi,
+      /\bлек\.?\b/gi,
+      /\bлк\.?\b/gi,
+      /\bпр\.\s*з\.?\b/gi,
+      /\bпрак\.?\b/gi,
+    ];
+
+    for (const pattern of typePatterns) {
+      subject = subject.replace(pattern, " ");
+    }
+  }
+
+  if (place) {
+    subject = subject.replace(
+      new RegExp(
+        `\\b${place.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
+        "giu",
+      ),
+      " ",
+    );
+  }
+
+  subject = cleanText(subject);
+
+  if (subject.length >= 2) {
+    lesson.subject = subject;
+  }
+
+  /*
+   * For cases where the date range is the only clue about
+   * which half of the semester the lesson belongs to, keep
+   * the range in lesson.weeks. The two-week table structure
+   * itself is authoritative for I / II.
+   */
+  return lesson.subject ? lesson : null;
+}
+
+function isEmptyCell(
+  $: cheerio.CheerioAPI,
+  cell: cheerio.AnyNode,
+): boolean {
+  const text = cleanText($(cell).text());
+
+  return (
+    !text ||
+    text === "-" ||
+    text === "—" ||
+    text === "\u00a0"
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Real ISUCT table parser
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Parses the actual ISUCT schedule table:
+ *
+ * header row 1:
+ *   нед | Время | Занятия
+ *
+ * header row 2:
+ *   Понедельник | Вторник | ...
+ *
+ * data:
+ *   1 | 08:00-09:35 | day1 | day2 | ... | day6
+ *     | 09:50-11:25 | day1 | ...
+ *     | ...
+ *   2 | 08:00-09:35 | ...
+ *
+ * The first column has rowspan and therefore is NOT present
+ * in every following row.
+ */
+function parseIsuctScheduleTable(
+  $: cheerio.CheerioAPI,
+  $table: cheerio.Cheerio<table>,
+  type: ScheduleType,
+  queryName: string,
+  queryId: string,
+  semesterStart: string,
+): FullSchedule | null {
+  const weeks: Record<WeekParity, ReturnType<typeof emptyWeek>> = {
+    I: emptyWeek("I"),
+    II: emptyWeek("II"),
+  };
+
+  const rows = $table.find("tr").toArray();
+
+  if (rows.length < 3) {
+    return null;
+  }
+
+  // ---------------------------------------------------------
+  // Find the header containing Monday...Saturday
+  // ---------------------------------------------------------
+
+  let headerRowIndex = -1;
+
+  for (let i = 0; i < Math.min(rows.length, 5); i++) {
+    const $row = $(rows[i]);
+
+    const rowText = cleanText(
+      $row.text(),
+    ).toLowerCase();
+
+    if (
+      rowText.includes("понедельник") ||
+      rowText.includes("вторник") ||
+      rowText.includes("среда")
+    ) {
+      headerRowIndex = i;
+      break;
+    }
+  }
+
+  if (headerRowIndex < 0) {
+    return null;
+  }
+
+  const dayColumns: WeekDayIndex[] = [];
+
+  const $header = $(rows[headerRowIndex]);
+
+  $header
+    .find("th, td")
+    .each((_, cell) => {
+      const day = detectDay(
+        cleanText($(cell).text()),
+      );
+
+      if (day) {
+        dayColumns.push(day);
+      }
+    });
+
+  if (dayColumns.length < 5) {
+    return null;
+  }
+
+  // ---------------------------------------------------------
+  // Parse rows after day header
+  // ---------------------------------------------------------
+
+  let currentWeek: WeekParity = "I";
+
+  let currentWeekNumber = 1;
+
+  let currentTime = "";
+
+  for (
+    let rowIndex = headerRowIndex + 1;
+    rowIndex < rows.length;
+    rowIndex++
+  ) {
+    const $row = $(rows[rowIndex]);
+    const cells = $row.find("td, th").toArray();
+
+    if (!cells.length) {
+      continue;
+    }
+
+    const firstText = cleanText(
+      $(cells[0]).text(),
+    );
+
+    /*
+     * Week number cells use rowspan="4":
+     *
+     * 1
+     * 2
+     *
+     * So when we see "1" or "2" in the first
+     * cell and it is actually a row-spanning week marker,
+     * switch parity.
+     */
+    const rowSpan =
+      $(cells[0]).attr("rowspan");
+
+    const numericWeek = /^\d+$/.test(firstText)
+      ? Number(firstText)
+      : null;
+
+    if (
+      numericWeek !== null &&
+      numericWeek >= 1 &&
+      numericWeek <= 2 &&
+      rowSpan
+    ) {
+      currentWeekNumber = numericWeek;
+      currentWeek =
+        numericWeek % 2 === 0
+          ? "II"
+          : "I";
+    }
+
+    /*
+     * Determine where the time cell is.
+     *
+     * For first row of a week:
+     *   [week] [time] [mon] ... [sat]
+     *
+     * For following rows:
+     *   [time] [mon] ... [sat]
+     */
+    let timeIndex = 0;
+
+    const possibleTimeWithWeek =
+      parseTime(
+        cleanText($(cells[1]).text()),
+      );
+
+    const possibleTimeWithoutWeek =
+      parseTime(
+        cleanText($(cells[0]).text()),
+      );
+
+    if (possibleTimeWithWeek) {
+      timeIndex = 1;
+      currentTime = possibleTimeWithWeek;
+    } else if (possibleTimeWithoutWeek) {
+      timeIndex = 0;
+      currentTime = possibleTimeWithoutWeek;
+    } else {
+      /*
+       * This can happen on malformed/merged rows.
+       * Skip instead of associating the lesson with
+       * the wrong time.
+       */
+      continue;
+    }
+
+    const lessonStartIndex = timeIndex + 1;
+
+    for (
+      let dayOffset = 0;
+      dayOffset < dayColumns.length;
+      dayOffset++
+    ) {
+      const cellIndex =
+        lessonStartIndex + dayOffset;
+
+      const cell = cells[cellIndex];
+
+      if (!cell) {
+        continue;
+      }
+
+      if (isEmptyCell($, cell)) {
+        continue;
+      }
+
+      const day = dayColumns[dayOffset];
+
+      const lesson = parseLessonCell(
+        $,
+        cell,
+        currentTime,
+      );
+
+      if (!lesson) {
+        continue;
+      }
+
+      weeks[currentWeek]
+        .days[day - 1]
+        .lessons
+        .push(lesson);
+    }
+  }
+
+  const hasFirstWeek = weeks.I.days.some(
+    (day) => day.lessons.length > 0,
+  );
+
+  const hasSecondWeek = weeks.II.days.some(
+    (day) => day.lessons.length > 0,
+  );
+
+  if (!hasFirstWeek && !hasSecondWeek) {
+    return null;
+  }
+
+  return {
+    type,
+    queryName,
+    queryId,
+
+    weeks,
+
+    currentParity:
+      computeCurrentParity(
+        semesterStart,
+        "I",
+      ),
+
+    semesterStart,
+
+    fetchedAt:
+      new Date().toISOString(),
+
+    source: "live",
+  };
+}
+
+/**
+ * Public HTML parser.
+ *
+ * It accepts:
+ *   - raw schedule HTML
+ *   - Drupal command.data
+ *   - a larger wrapper containing the schedule
+ */
 export function parseScheduleHtml(
   html: string,
   type: ScheduleType,
@@ -246,254 +1025,434 @@ export function parseScheduleHtml(
   semesterStart: string,
 ): FullSchedule | null {
   try {
-    const $ = cheerio.load(html);
+    const $ = cheerio.load(
+      decodeHtmlEntities(html),
+      {
+        decodeEntities: true,
+      },
+    );
 
-    // Try multiple containers — the schedule might be in:
-    // 1. #form-ajax-node-content (Drupal AJAX response)
-    // 2. .region-content (full page)
-    // 3. .stud-schedule (custom class)
-    // 4. Any table with schedule-like content
-    let root =
-      $("#form-ajax-node-content").html() ||
-      $(".region-content").html() ||
-      $(".stud-schedule").html() ||
-      $("body").html() ||
-      html;
+    let bestSchedule: FullSchedule | null = null;
 
-    const $root = cheerio.load(`<div id="root">${root}</div>`);
-    const tables = $root("table");
+    $("table.schedule").each((_, element) => {
+      const parsed = parseIsuctScheduleTable(
+        $,
+        $(element),
+        type,
+        queryName,
+        queryId,
+        semesterStart,
+      );
 
-    // If no tables found in the root, search the full HTML
-    if (!tables.length) {
-      const $full = cheerio.load(html);
-      const allTables = $full("table");
-      // Look for tables that contain schedule-like content (day names, times)
-      let scheduleFound = false;
-      allTables.each((_, table) => {
-        const text = $full(table).text().toLowerCase();
-        if (text.includes("понедельник") || text.includes("вторник") ||
-            text.includes("среда") || text.includes("четверг") ||
-            text.includes("пятница") || text.includes("суббота") ||
-            /\d{1,2}:\d{2}/.test(text)) {
-          scheduleFound = true;
-        }
-      });
-      if (!scheduleFound) return null;
-      // Use the full HTML for parsing
-      const $fullRoot = cheerio.load(`<div id="root">${html}</div>`);
-      return parseFromCheerio($fullRoot, type, queryName, queryId, semesterStart);
+      if (parsed) {
+        bestSchedule = parsed;
+      }
+    });
+
+    if (bestSchedule) {
+      return bestSchedule;
     }
 
-    return parseFromCheerio($root, type, queryName, queryId, semesterStart);
+    /*
+     * Fallback for a possible future server-side markup change.
+     */
+    $("table").each((_, element) => {
+      if (bestSchedule) return;
+
+      const tableText = cleanText(
+        $(element).text(),
+      ).toLowerCase();
+
+      const looksLikeSchedule =
+        tableText.includes("понедельник") &&
+        /\d{1,2}:\d{2}/.test(tableText);
+
+      if (!looksLikeSchedule) {
+        return;
+      }
+
+      const parsed = parseIsuctScheduleTable(
+        $,
+        $(element),
+        type,
+        queryName,
+        queryId,
+        semesterStart,
+      );
+
+      if (parsed) {
+        bestSchedule = parsed;
+      }
+    });
+
+    return bestSchedule;
+  } catch (error) {
+    console.error(
+      "[ISUCT] parseScheduleHtml error:",
+      error,
+    );
+
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Drupal AJAX response
+// ─────────────────────────────────────────────────────────────
+
+interface DrupalAjaxCommand {
+  command?: string;
+  method?: string | null;
+  selector?: string | null;
+  data?: string | null;
+  settings?: unknown;
+}
+
+function extractScheduleHtmlFromAjax(
+  responseText: string,
+): {
+  html: string;
+  pdfUrl?: string;
+} | null {
+  try {
+    const commands =
+      JSON.parse(
+        responseText,
+      ) as DrupalAjaxCommand[];
+
+    if (!Array.isArray(commands)) {
+      return null;
+    }
+
+    let html = "";
+    let pdfUrl: string | undefined;
+
+    for (const command of commands) {
+      if (
+        command.command === "insert" &&
+        typeof command.data === "string" &&
+        command.data.includes(
+          '<table class="schedule"',
+        )
+      ) {
+        html += command.data;
+
+        const pdfMatch =
+          command.data.match(
+            /href=["']([^"']+\.pdf(?:\?[^"']*)?)["']/i,
+          );
+
+        if (pdfMatch) {
+          pdfUrl = pdfMatch[1];
+        }
+      }
+    }
+
+    if (!html) {
+      return null;
+    }
+
+    return {
+      html,
+      pdfUrl,
+    };
   } catch {
     return null;
   }
 }
 
-function parseFromCheerio(
-  $root: cheerio.CheerioAPI,
-  type: ScheduleType,
-  queryName: string,
-  queryId: string,
-  semesterStart: string,
-): FullSchedule | null {
-  const tables = $root("table");
-  if (!tables.length) return null;
-
-  const weeks: Record<WeekParity, { parity: WeekParity; days: DaySchedule[] }> = {
-    I: { parity: "I", days: [1, 2, 3, 4, 5, 6, 7].map((d) => ({ day: d as WeekDayIndex, lessons: [] })) },
-    II: { parity: "II", days: [1, 2, 3, 4, 5, 6, 7].map((d) => ({ day: d as WeekDayIndex, lessons: [] })) },
-  };
-
-  let currentParity: WeekParity = "I";
-
-  // Detect week parity from headings
-  const headings = $root("h1, h2, h3, h4, h5, strong, b, .schedule-week, td, th, div");
-  headings.each((_, el) => {
-    const txt = cleanText($root(el).text());
-    if (/II\s*недел/i.test(txt)) currentParity = "II";
-    else if (/I\s*недел/i.test(txt) && !/II/i.test(txt)) currentParity = "I";
-    else if (/неч[её]тн/i.test(txt)) currentParity = "I";
-    else if (/ч[её]тн/i.test(txt)) currentParity = "II";
-  });
-
-  tables.each((_, table) => {
-    const $table = $root(table);
-    const headerCells = $table.find("tr").first().find("th, td");
-    const dayColumns: (WeekDayIndex | null)[] = [];
-    headerCells.each((_, cell) => {
-      const t = cleanText($root(cell).text());
-      dayColumns.push(detectDay(t));
-    });
-    const rows = $table.find("tr").slice(1);
-
-    if (dayColumns.some((d) => d !== null)) {
-      // Layout A: columns are days, rows are time slots
-      rows.each((_, row) => {
-        const cells = $root(row).find("td");
-        cells.each((ci, cell) => {
-          const day = dayColumns[ci];
-          if (!day) return;
-          const lesson = parseLessonCell($root, cell);
-          if (lesson) weeks[currentParity].days[day - 1].lessons.push(lesson);
-        });
-      });
-    } else {
-      // Layout B: each row = one lesson, first cell = day
-      let lastDay: WeekDayIndex | null = null;
-      rows.each((_, row) => {
-        const cells = $root(row).find("td, th");
-        const cellsArr = cells.toArray();
-        if (!cellsArr.length) return;
-        const firstTxt = cleanText($root(cellsArr[0]).text());
-        const day = detectDay(firstTxt) ?? lastDay;
-        if (day) lastDay = day;
-        if (!day) return;
-        const timeTxt = cellsArr.length > 1 ? cleanText($root(cellsArr[1]).text()) : firstTxt;
-        const time = parseTime(timeTxt) || parseTime(firstTxt);
-        if (!time) return;
-        const subjectCell = cellsArr.length > 2 ? $root(cellsArr[2]) : $root(cellsArr[1]);
-        const lesson = parseLessonCell($root, subjectCell[0] as cheerio.AnyNode);
-        if (lesson) {
-          lesson.time = time;
-          weeks[currentParity].days[day - 1].lessons.push(lesson);
-        }
-      });
-    }
-  });
-
-  const hasAny = weeks.I.days.some((d) => d.lessons.length) ||
-    weeks.II.days.some((d) => d.lessons.length);
-  if (!hasAny) return null;
-
-  const computed = computeCurrentParity(semesterStart, "II");
-  return {
-    type, queryName, queryId, weeks,
-    currentParity: computed,
-    semesterStart,
-    fetchedAt: new Date().toISOString(),
-    source: "live",
-  };
-}
-
-function parseLessonCell($: cheerio.CheerioAPI, cell: cheerio.AnyNode): Lesson | null {
-  const $cell = $(cell);
-  const html = $cell.html() || "";
-  const text = cleanText($cell.text());
-  if (!text || text.length < 2) return null;
-  const lines = html.split(/<br\s*\/?>/i).map((l) => cleanText($(l).text())).filter(Boolean);
-  const subject = lines[0] || text.split(/[,;]/)[0] || text;
-  const lesson: Lesson = { time: "", subject: subject.replace(/\s+/g, " ").trim() };
-  if (!lesson.subject) return null;
-  for (let i = 1; i < lines.length; i++) {
-    const ln = lines[i];
-    if (/лек/i.test(ln)) lesson.type = "лек";
-    else if (/прак/i.test(ln)) lesson.type = "прак";
-    else if (/лаб/i.test(ln)) lesson.type = "лаб";
-    else if (/зач/i.test(ln)) lesson.type = "зач";
-    else if (/экз/i.test(ln)) lesson.type = "экз";
-    const place = ln.match(/([А-ЯA-Z]{1,3}[-]?\d{1,4}[А-ЯA-Z]?|ауд\.?\s*\S+)/i);
-    if (place) lesson.place = place[1];
-    if (/подгрупп/i.test(ln)) {
-      const sg = ln.match(/([12])\s*подгруп/i);
-      if (sg) lesson.subgroup = `${sg[1]} п/г`;
-    }
-    if (/нед/i.test(ln)) lesson.weeks = ln;
-    if (/препод/i.test(ln) || /^[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.?/.test(ln)) {
-      const tm = ln.match(/([А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.?)\s*$/);
-      if (tm) lesson.teacher = tm[1];
-    }
-    if (/групп/i.test(ln)) {
-      const gm = ln.match(/([0-9А-ЯA-Z/]{2,8})/);
-      if (gm) lesson.group = gm[1];
-    }
-  }
-  if (!lesson.time) {
-    const t = parseTime(text);
-    if (t) lesson.time = t;
-  }
-  return lesson;
-}
-
-// ─── Schedule fetching ──────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Live schedule fetch
+// ─────────────────────────────────────────────────────────────
 
 export async function fetchLiveSchedule(
   type: ScheduleType,
   id: string,
   name: string,
-  semesterStart = "2025-09-02",
+  semesterStart = "2026-09-07",
 ): Promise<FullSchedule | null> {
+  if (circuitOpen()) {
+    return null;
+  }
+
   try {
-    const ctx = await getFormContext();
-    if (!ctx) return null;
+    const context = await getFormContext();
 
-    // KEY FIX: The idgrid/idprepid/idaudid field expects a NUMERIC ID from
-    // autocomplete. When autocomplete is unavailable, pass EMPTY string "".
-    // The hidden field starts empty in the HTML form, and Drupal accepts
-    // an empty ID — it falls back to looking up by the text field (idgr).
-    const numericId = /^\d+$/.test(id) ? id : "";
+    if (!context) {
+      return null;
+    }
 
-    const body = new URLSearchParams({
-      type: TYPE_FIELD[type],
-      [TEXT_FIELD[type]]: name,
-      [ID_FIELD[type]]: numericId,  // empty string if not numeric
-      form_build_id: ctx.buildId,
-      form_id: "studschedule_form",
-      op: "Показать расписание",
-    });
+    /*
+     * For the real Drupal form:
+     *
+     * group:
+     *   type=currentstudentsgroups
+     *   idgr=2/278
+     *   idgrid=22852
+     *
+     * teacher:
+     *   type=prepod
+     *   idprep=...
+     *   idprepid=...
+     *
+     * auditorium:
+     *   type=auditorium
+     *   idaud=...
+     *   idaudid=...
+     */
+    const body = new URLSearchParams();
 
-    const { signal, clear } = withTimeout(20000); // 20 seconds (was 7)
-    const res = await fetch(SCHEDULE_BASE_URL, {
-      method: "POST",
-      headers: {
-        "User-Agent": UA,
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        Cookie: ctx.cookie,
-        Referer: SCHEDULE_BASE_URL,
-        Origin: "https://www.isuct.ru",
-      },
-      body: body.toString(),
-      signal,
-      redirect: "follow",
-    });
+    body.set(
+      "type",
+      TYPE_FIELD[type],
+    );
+
+    body.set(
+      "idaud",
+      type === "auditorium"
+        ? name
+        : "",
+    );
+
+    body.set(
+      "idprep",
+      type === "teacher"
+        ? name
+        : "",
+    );
+
+    body.set(
+      "idgr",
+      type === "group"
+        ? name
+        : "",
+    );
+
+    body.set(
+      "idprepid",
+      type === "teacher"
+        ? id
+        : "",
+    );
+
+    body.set(
+      "idaudid",
+      type === "auditorium"
+        ? id
+        : "",
+    );
+
+    body.set(
+      "idgrid",
+      type === "group"
+        ? id
+        : "",
+    );
+
+    body.set(
+      "form_build_id",
+      context.buildId,
+    );
+
+    body.set(
+      "form_id",
+      "studschedule_form",
+    );
+
+    /*
+     * This is important.
+     * The browser sends these Drupal AJAX triggering fields.
+     */
+    body.set(
+      "_triggering_element_name",
+      "op",
+    );
+
+    body.set(
+      "_triggering_element_value",
+      "Показать расписание",
+    );
+
+    const { signal, clear } =
+      withTimeout(30_000);
+
+    const response =
+      await fetch(AJAX_URL, {
+        method: "POST",
+        redirect: "follow",
+        signal,
+
+        headers: {
+          "User-Agent": UA,
+
+          "Accept":
+            "application/json, text/javascript, */*; q=0.01",
+
+          "Accept-Language":
+            "ru-RU,ru;q=0.9,en;q=0.8",
+
+          "Content-Type":
+            "application/x-www-form-urlencoded; charset=UTF-8",
+
+          "X-Requested-With":
+            "XMLHttpRequest",
+
+          "Origin":
+            ISUCT_ORIGIN,
+
+          "Referer":
+            SCHEDULE_BASE_URL,
+
+          ...(context.cookie
+            ? {
+                Cookie:
+                  context.cookie,
+              }
+            : {}),
+        },
+
+        body:
+          body.toString(),
+      });
+
     clear();
-    if (!res.ok) {
+
+    if (!response.ok) {
+      console.error(
+        `[ISUCT] /system/ajax failed: ${response.status} ${response.statusText}`,
+      );
+
       recordFailure();
       return null;
     }
-    const html = await res.text();
-    const parsed = parseScheduleHtml(html, type, name, id, semesterStart);
-    if (parsed) {
-      recordSuccess();
-    } else {
+
+    const contentType =
+      response.headers.get(
+        "content-type",
+      ) || "";
+
+    const responseText =
+      await response.text();
+
+    console.log(
+      `[ISUCT] AJAX response: status=${response.status}, content-type=${contentType}, bytes=${responseText.length}`,
+    );
+
+    const extracted =
+      extractScheduleHtmlFromAjax(
+        responseText,
+      );
+
+    if (!extracted) {
+      console.error(
+        "[ISUCT] Schedule HTML was not found in Drupal AJAX response",
+      );
+
+      console.error(
+        responseText.slice(0, 3000),
+      );
+
       recordFailure();
+      return null;
     }
+
+    const parsed =
+      parseScheduleHtml(
+        extracted.html,
+        type,
+        name,
+        id,
+        semesterStart,
+      );
+
+    if (!parsed) {
+      console.error(
+        "[ISUCT] Schedule HTML found, but parser returned null",
+      );
+
+      recordFailure();
+      return null;
+    }
+
+    /*
+     * Optional debug information.
+     */
+    if (extracted.pdfUrl) {
+      console.log(
+        `[ISUCT] PDF: ${extracted.pdfUrl}`,
+      );
+    }
+
+    const totalLessons =
+      parsed.weeks.I.days.reduce(
+        (sum, day) =>
+          sum + day.lessons.length,
+        0,
+      ) +
+      parsed.weeks.II.days.reduce(
+        (sum, day) =>
+          sum + day.lessons.length,
+        0,
+      );
+
+    console.log(
+      `[ISUCT] Parsed ${totalLessons} lessons for ${name}`,
+    );
+
+    recordSuccess();
+
     return parsed;
-  } catch {
+  } catch (error) {
+    console.error(
+      "[ISUCT] fetchLiveSchedule error:",
+      error,
+    );
+
     recordFailure();
+
     return null;
   }
 }
 
-// ─── Validation ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Validation
+// ─────────────────────────────────────────────────────────────
 
-export function validateQuery(type: ScheduleType, query: string): string | null {
-  const q = query.trim();
-  if (!q) return "Введите текст для поиска";
+export function validateQuery(
+  type: ScheduleType,
+  query: string,
+): string | null {
+  const value =
+    query.trim();
+
+  if (!value) {
+    return "Введите текст для поиска";
+  }
 
   if (type === "group") {
-    if (q.length < 2) {
-      return "Номер группы слишком короткий. Пример: 2/25, ХТ-21";
+    if (value.length < 2) {
+      return (
+        "Номер группы слишком короткий. " +
+        "Пример: 2/25"
+      );
     }
-  } else if (type === "teacher") {
-    if (q.length < 3) {
-      return "Введите фамилию преподавателя (минимум 3 символа). Пример: Смирнов";
+  }
+
+  if (type === "teacher") {
+    if (value.length < 3) {
+      return (
+        "Введите фамилию преподавателя " +
+        "(минимум 3 символа)."
+      );
     }
-  } else if (type === "auditorium") {
-    if (q.length < 2) {
-      return "Введите номер аудитории (минимум 2 символа). Пример: Г203";
+  }
+
+  if (type === "auditorium") {
+    if (value.length < 2) {
+      return (
+        "Введите номер аудитории. " +
+        "Пример: Г203"
+      );
     }
   }
 
